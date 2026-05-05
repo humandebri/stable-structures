@@ -5,8 +5,8 @@ This is an intentional design decision that limits [the blast radius](../introdu
 
 ## Overview
 
-The Memory Manager enables the creation of up to 255 virtual memories from a single underlying memory instance.
-When used with stable memory, this allows you to maintain up to 255 separate stable structures, each with its own isolated memory space.
+The Memory Manager enables the creation of up to 65,535 virtual memory IDs from a single underlying memory instance.
+When used with stable memory, this allows you to maintain separate stable structures, each with its own isolated memory space. The number of non-empty virtual memories is bounded by the number of buckets the memory manager can allocate.
 
 ## Usage Example
 
@@ -30,6 +30,8 @@ map_1.insert(1, 2);
 map_2.insert(1, 3);
 assert_eq!(map_1.get(&1), Some(2)); // Succeeds as expected
 ```
+
+If a memory ID is stored as a `u8`, use `MemoryId::from(id)` or `MemoryId::new(id.into())`.
 
 ```admonish warning ""
 Virtual memories from the `MemoryManager` cannot be shared between stable structures.

@@ -46,13 +46,11 @@ use crate::{
     write, write_struct, Memory, WASM_PAGE_SIZE,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 const MAGIC: &[u8; 3] = b"MGR";
-const LAYOUT_VERSION: u8 = 1;
-
-// The maximum number of memories that can be created.
-const MAX_NUM_MEMORIES: u8 = 255;
+const LAYOUT_VERSION: u8 = 2;
 
 // The maximum number of buckets the memory manager can handle.
 // With a bucket size of 128 pages this can support up to 256GiB of memory.
@@ -61,19 +59,26 @@ const MAX_NUM_BUCKETS: u64 = 32768;
 const BUCKET_SIZE_IN_PAGES: u64 = 128;
 
 // A value used internally to indicate that a bucket is unallocated.
-const UNALLOCATED_BUCKET_MARKER: u8 = MAX_NUM_MEMORIES;
+const UNALLOCATED_BUCKET_MARKER: u16 = u16::MAX;
 
 // The offset where buckets are in memory.
-const BUCKETS_OFFSET_IN_PAGES: u64 = 1;
+const BUCKET_OWNER_TABLE_OFFSET_IN_PAGES: u64 = 1;
+const MEMORY_SIZE_TABLE_OFFSET_IN_PAGES: u64 = 2;
+const MEMORY_SIZE_TABLE_NUM_PAGES: u64 = 8;
+const BUCKETS_OFFSET_IN_PAGES: u64 =
+    MEMORY_SIZE_TABLE_OFFSET_IN_PAGES + MEMORY_SIZE_TABLE_NUM_PAGES;
 const BUCKETS_OFFSET_IN_BYTES: u64 = BUCKETS_OFFSET_IN_PAGES * WASM_PAGE_SIZE;
+const BUCKET_OWNER_ENTRY_SIZE_IN_BYTES: u64 = 2;
+const MEMORY_SIZE_ENTRY_SIZE_IN_BYTES: u64 = 8;
 
 // Reserved bytes in the header for future extensions.
 const HEADER_RESERVED_BYTES: usize = 32;
 
 /// A memory manager simulates multiple memories within a single memory.
 ///
-/// The memory manager can return up to 255 unique instances of [`VirtualMemory`], and each can be
-/// used independently and can grow up to the bounds of the underlying memory.
+/// The memory manager can return up to 65,535 unique instances of [`VirtualMemory`], and each can
+/// be used independently and can grow up to the bounds of the underlying memory. The number of
+/// non-empty memories is bounded by the number of buckets the memory manager can allocate.
 ///
 /// By default, the memory manager divides the memory into "buckets" of 128 pages. Each
 /// [`VirtualMemory`] is internally represented as a list of buckets. Buckets of different memories
@@ -83,10 +88,10 @@ const HEADER_RESERVED_BYTES: usize = 32;
 /// Because a [`VirtualMemory`] is a list of buckets, this implies that internally it grows one
 /// bucket at a time.
 ///
-/// The first page of the memory is reserved for the memory manager's own state. The layout for
-/// this state is as follows:
+/// The first ten pages of the memory are reserved for the memory manager's own state. The layout
+/// for this state is as follows:
 ///
-/// # V1 layout
+/// # V2 layout
 ///
 /// ```text
 /// -------------------------------------------------- <- Address 0
@@ -100,30 +105,24 @@ const HEADER_RESERVED_BYTES: usize = 32;
 /// --------------------------------------------------
 /// Reserved space                        ↕ 32 bytes
 /// --------------------------------------------------
-/// Size of memory 0 (in pages)           ↕ 8 bytes
+/// Unallocated space                     ↕ remaining bytes of page 0
+/// -------------------------------------------------- <- Bucket allocations (Page 1)
+/// Bucket 1                              ↕ 2 bytes       (u16 memory owner)
 /// --------------------------------------------------
-/// Size of memory 1 (in pages)           ↕ 8 bytes
-/// --------------------------------------------------
-/// ...
-/// --------------------------------------------------
-/// Size of memory 254 (in pages)         ↕ 8 bytes
-/// -------------------------------------------------- <- Bucket allocations
-/// Bucket 1                              ↕ 1 byte        (1 byte indicating which memory owns it)
-/// --------------------------------------------------
-/// Bucket 2                              ↕ 1 byte
+/// Bucket 2                              ↕ 2 bytes
 /// --------------------------------------------------
 /// ...
 /// --------------------------------------------------
-/// Bucket `MAX_NUM_BUCKETS`              ↕ 1 byte
+/// Bucket `MAX_NUM_BUCKETS`              ↕ 2 bytes
 /// --------------------------------------------------
-/// Unallocated space                     ↕ 30'688 bytes
-/// -------------------------------------------------- <- Buckets (Page 1)
+/// Memory size table                     ↕ 8 pages       (u64 size indexed by memory ID)
+/// -------------------------------------------------- <- Buckets (Page 10)
 /// Bucket 1                              ↕ N pages
-/// -------------------------------------------------- <- Page N + 1
+/// -------------------------------------------------- <- Page N + 10
 /// Bucket 2                              ↕ N pages
 /// --------------------------------------------------
 /// ...
-/// -------------------------------------------------- <- Page ((MAX_NUM_BUCKETS - 1) * N + 1)
+/// -------------------------------------------------- <- Page ((MAX_NUM_BUCKETS - 1) * N + 10)
 /// Bucket MAX_NUM_BUCKETS                ↕ N pages
 /// ```
 ///
@@ -186,15 +185,6 @@ struct Header {
 
     /// Reserved bytes for future extensions
     _reserved: [u8; HEADER_RESERVED_BYTES],
-
-    /// The size of each individual memory that can be created by the memory manager.
-    memory_sizes_in_pages: [u64; MAX_NUM_MEMORIES as usize],
-}
-
-impl Header {
-    fn size() -> Bytes {
-        Bytes::new(core::mem::size_of::<Self>() as u64)
-    }
 }
 
 #[derive(Clone)]
@@ -241,11 +231,11 @@ struct MemoryManagerInner<M: Memory> {
 
     bucket_size_in_pages: u16,
 
-    /// An array storing the size (in pages) of each of the managed memories.
-    memory_sizes_in_pages: [u64; MAX_NUM_MEMORIES as usize],
+    /// The size (in pages) of each non-empty managed memory.
+    memory_sizes_in_pages: BTreeMap<MemoryId, u64>,
 
     /// A map mapping each managed memory to the bucket ids that are allocated to it.
-    memory_buckets: Vec<Vec<BucketId>>,
+    memory_buckets: BTreeMap<MemoryId, Vec<BucketId>>,
 }
 
 impl<M: Memory> MemoryManagerInner<M> {
@@ -271,19 +261,16 @@ impl<M: Memory> MemoryManagerInner<M> {
         let mem_mgr = Self {
             memory,
             allocated_buckets: 0,
-            memory_sizes_in_pages: [0; MAX_NUM_MEMORIES as usize],
-            memory_buckets: vec![vec![]; MAX_NUM_MEMORIES as usize],
+            memory_sizes_in_pages: BTreeMap::new(),
+            memory_buckets: BTreeMap::new(),
             bucket_size_in_pages,
         };
 
         mem_mgr.save_header();
 
         // Mark all the buckets as unallocated.
-        write(
-            &mem_mgr.memory,
-            bucket_allocations_address(BucketId(0)).get(),
-            &[UNALLOCATED_BUCKET_MARKER; MAX_NUM_BUCKETS as usize],
-        );
+        mem_mgr.save_bucket_owner_table();
+        mem_mgr.save_memory_size_table();
 
         mem_mgr
     }
@@ -294,18 +281,16 @@ impl<M: Memory> MemoryManagerInner<M> {
         assert_eq!(&header.magic, MAGIC, "Bad magic.");
         assert_eq!(header.version, LAYOUT_VERSION, "Unsupported version.");
 
-        let mut buckets = vec![];
-        read_to_vec(
-            &memory,
-            bucket_allocations_address(BucketId(0)),
-            &mut buckets,
-            MAX_NUM_BUCKETS as usize,
-        );
+        let memory_sizes_in_pages = load_memory_size_table(&memory);
+        let bucket_owners = load_bucket_owner_table(&memory);
 
-        let mut memory_buckets = vec![vec![]; MAX_NUM_MEMORIES as usize];
-        for (bucket_idx, memory) in buckets.into_iter().enumerate() {
-            if memory != UNALLOCATED_BUCKET_MARKER {
-                memory_buckets[memory as usize].push(BucketId(bucket_idx as u16));
+        let mut memory_buckets: BTreeMap<MemoryId, Vec<BucketId>> = BTreeMap::new();
+        for (bucket_idx, memory_id) in bucket_owners.into_iter().enumerate() {
+            if memory_id != UNALLOCATED_BUCKET_MARKER {
+                memory_buckets
+                    .entry(MemoryId(memory_id))
+                    .or_default()
+                    .push(BucketId(bucket_idx as u16));
             }
         }
 
@@ -313,7 +298,7 @@ impl<M: Memory> MemoryManagerInner<M> {
             memory,
             allocated_buckets: header.num_allocated_buckets,
             bucket_size_in_pages: header.bucket_size_in_pages,
-            memory_sizes_in_pages: header.memory_sizes_in_pages,
+            memory_sizes_in_pages,
             memory_buckets,
         }
     }
@@ -325,15 +310,45 @@ impl<M: Memory> MemoryManagerInner<M> {
             num_allocated_buckets: self.allocated_buckets,
             bucket_size_in_pages: self.bucket_size_in_pages,
             _reserved: [0; HEADER_RESERVED_BYTES],
-            memory_sizes_in_pages: self.memory_sizes_in_pages,
         };
 
         write_struct(&header, Address::from(0), &self.memory);
     }
 
+    fn save_bucket_owner_table(&self) {
+        let mut owners = vec![0; (MAX_NUM_BUCKETS * BUCKET_OWNER_ENTRY_SIZE_IN_BYTES) as usize];
+        for bucket_idx in 0..MAX_NUM_BUCKETS as usize {
+            let offset = bucket_idx * BUCKET_OWNER_ENTRY_SIZE_IN_BYTES as usize;
+            owners[offset..offset + 2].copy_from_slice(&UNALLOCATED_BUCKET_MARKER.to_le_bytes());
+        }
+        write(
+            &self.memory,
+            bucket_allocations_address(BucketId(0)).get(),
+            &owners,
+        );
+    }
+
+    fn save_memory_size_table(&self) {
+        let mut entries = vec![0; (MEMORY_SIZE_TABLE_NUM_PAGES * WASM_PAGE_SIZE) as usize];
+        for (memory_id, size_in_pages) in self.memory_sizes_in_pages.iter() {
+            let offset = memory_size_entry_offset(*memory_id) as usize;
+            entries[offset..offset + 8].copy_from_slice(&size_in_pages.to_le_bytes());
+        }
+        write(&self.memory, memory_size_table_address().get(), &entries);
+    }
+
+    fn save_memory_size_entry(&self, id: MemoryId, size_in_pages: u64) {
+        let entry = size_in_pages.to_le_bytes();
+        write(
+            &self.memory,
+            (memory_size_table_address() + Bytes::from(memory_size_entry_offset(id))).get(),
+            &entry,
+        );
+    }
+
     /// Returns the size of a memory (in pages).
     fn memory_size(&self, id: MemoryId) -> u64 {
-        self.memory_sizes_in_pages[id.0 as usize]
+        self.memory_sizes_in_pages.get(&id).copied().unwrap_or(0)
     }
 
     /// Grows the memory with the given id by the given number of pages.
@@ -350,7 +365,7 @@ impl<M: Memory> MemoryManagerInner<M> {
             return -1;
         }
 
-        let memory_bucket = &mut self.memory_buckets[id.0 as usize];
+        let memory_bucket = self.memory_buckets.entry(id).or_default();
         // Allocate new buckets as needed.
         memory_bucket.reserve(new_buckets_needed as usize);
         for _ in 0..new_buckets_needed {
@@ -361,7 +376,7 @@ impl<M: Memory> MemoryManagerInner<M> {
             write(
                 &self.memory,
                 bucket_allocations_address(new_bucket_id).get(),
-                &[id.0],
+                &id.0.to_le_bytes(),
             );
 
             self.allocated_buckets += 1;
@@ -379,10 +394,15 @@ impl<M: Memory> MemoryManagerInner<M> {
         }
 
         // Update the memory with the new size.
-        self.memory_sizes_in_pages[id.0 as usize] = new_size;
+        if new_size == 0 {
+            self.memory_sizes_in_pages.remove(&id);
+        } else {
+            self.memory_sizes_in_pages.insert(id, new_size);
+        }
 
         // Update the header and return the old size.
         self.save_header();
+        self.save_memory_size_entry(id, new_size);
         old_size as i64
     }
 
@@ -502,13 +522,17 @@ impl<M: Memory> MemoryManagerInner<M> {
     /// the underlying buckets' addresses in real memory.
     fn for_each_bucket(
         &self,
-        MemoryId(id): MemoryId,
+        id: MemoryId,
         virtual_segment: VirtualSegment,
         bucket_cache: &BucketCache,
         mut func: impl FnMut(RealSegment),
     ) {
         // Get the buckets allocated to the given memory id.
-        let buckets = self.memory_buckets[id as usize].as_slice();
+        let buckets = self
+            .memory_buckets
+            .get(&id)
+            .map(|buckets| buckets.as_slice())
+            .unwrap_or(&[]);
         let bucket_size_in_bytes = self.bucket_size_in_bytes().get();
 
         let virtual_offset = virtual_segment.address.get();
@@ -585,10 +609,14 @@ struct RealSegment {
 }
 
 #[derive(Clone, Copy, Ord, Eq, PartialEq, PartialOrd, Debug)]
-pub struct MemoryId(u8);
+pub struct MemoryId(u16);
 
 impl MemoryId {
-    pub const fn new(id: u8) -> Self {
+    /// Creates a memory ID.
+    ///
+    /// If the ID is stored as a `u8`, use `MemoryId::from(id)` or
+    /// `MemoryId::new(id.into())`.
+    pub const fn new(id: u16) -> Self {
         // Any ID can be used except the special value that's used internally to
         // mark a bucket as unallocated.
         assert!(id != UNALLOCATED_BUCKET_MARKER);
@@ -597,12 +625,67 @@ impl MemoryId {
     }
 }
 
+impl From<u8> for MemoryId {
+    fn from(id: u8) -> Self {
+        Self(id.into())
+    }
+}
+
 // Referring to a bucket.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct BucketId(u16);
 
 fn bucket_allocations_address(id: BucketId) -> Address {
-    Address::from(0) + Header::size() + Bytes::from(id.0)
+    Address::from(BUCKET_OWNER_TABLE_OFFSET_IN_PAGES * WASM_PAGE_SIZE)
+        + Bytes::from(id.0) * Bytes::from(BUCKET_OWNER_ENTRY_SIZE_IN_BYTES)
+}
+
+fn memory_size_table_address() -> Address {
+    Address::from(MEMORY_SIZE_TABLE_OFFSET_IN_PAGES * WASM_PAGE_SIZE)
+}
+
+fn memory_size_entry_offset(id: MemoryId) -> u64 {
+    id.0 as u64 * MEMORY_SIZE_ENTRY_SIZE_IN_BYTES
+}
+
+fn load_bucket_owner_table(memory: &impl Memory) -> Vec<u16> {
+    let mut bytes = vec![0; (MAX_NUM_BUCKETS * BUCKET_OWNER_ENTRY_SIZE_IN_BYTES) as usize];
+    read_to_vec(
+        memory,
+        bucket_allocations_address(BucketId(0)),
+        &mut bytes,
+        (MAX_NUM_BUCKETS * BUCKET_OWNER_ENTRY_SIZE_IN_BYTES) as usize,
+    );
+    bytes
+        .chunks_exact(BUCKET_OWNER_ENTRY_SIZE_IN_BYTES as usize)
+        .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+        .collect()
+}
+
+fn load_memory_size_table(memory: &impl Memory) -> BTreeMap<MemoryId, u64> {
+    let mut bytes = vec![0; (MEMORY_SIZE_TABLE_NUM_PAGES * WASM_PAGE_SIZE) as usize];
+    read_to_vec(
+        memory,
+        memory_size_table_address(),
+        &mut bytes,
+        (MEMORY_SIZE_TABLE_NUM_PAGES * WASM_PAGE_SIZE) as usize,
+    );
+
+    let mut memory_sizes_in_pages = BTreeMap::new();
+    for (memory_id, entry) in bytes
+        .chunks_exact(MEMORY_SIZE_ENTRY_SIZE_IN_BYTES as usize)
+        .take(UNALLOCATED_BUCKET_MARKER as usize)
+        .enumerate()
+    {
+        let size_in_pages = u64::from_le_bytes([
+            entry[0], entry[1], entry[2], entry[3], entry[4], entry[5], entry[6], entry[7],
+        ]);
+        if size_in_pages != 0 {
+            memory_sizes_in_pages.insert(MemoryId(memory_id as u16), size_in_pages);
+        }
+    }
+
+    memory_sizes_in_pages
 }
 
 /// Cache which stores the last touched bucket and the corresponding real address.
@@ -660,11 +743,119 @@ mod test {
         Rc::new(RefCell::new(Vec::new()))
     }
 
+    fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ])
+    }
+
+    fn write_v1_header(memory: &Rc<RefCell<Vec<u8>>>) {
+        memory.grow(1);
+        memory.write(0, MAGIC);
+        memory.write(3, &[1]);
+    }
+
     #[test]
     fn can_get_memory() {
         let mem_mgr = MemoryManager::init(make_memory());
         let memory = mem_mgr.get(MemoryId(0));
         assert_eq!(memory.size(), 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn max_memory_id_is_reserved() {
+        MemoryId::new(u16::MAX);
+    }
+
+    #[test]
+    fn can_create_memory_id_from_u8() {
+        assert_eq!(MemoryId::from(42u8), MemoryId::new(42));
+    }
+
+    #[test]
+    #[should_panic(expected = "Unsupported version.")]
+    fn rejects_v1_layout() {
+        let mem = make_memory();
+        write_v1_header(&mem);
+
+        MemoryManager::init(mem);
+    }
+
+    #[test]
+    fn bucket_owner_table_stores_u16_owner_at_page_1() {
+        let mem = make_memory();
+        let mem_mgr = MemoryManager::init(mem.clone());
+        let memory = mem_mgr.get(MemoryId::new(65534));
+
+        assert_eq!(memory.grow(1), 0);
+
+        let bucket_0_offset = bucket_allocations_address(BucketId(0)).get() as usize;
+        let bucket_1_offset = bucket_allocations_address(BucketId(1)).get() as usize;
+        let mem = mem.borrow();
+
+        assert_eq!(
+            &mem[bucket_0_offset..bucket_0_offset + 2],
+            &65534u16.to_le_bytes()
+        );
+        assert_eq!(
+            &mem[bucket_1_offset..bucket_1_offset + 2],
+            &UNALLOCATED_BUCKET_MARKER.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn memory_size_table_stores_sizes_indexed_by_memory_id() {
+        let mem = make_memory();
+        let mem_mgr = MemoryManager::init(mem.clone());
+        let high_memory = mem_mgr.get(MemoryId::new(65534));
+        let low_memory = mem_mgr.get(MemoryId::new(42));
+
+        assert_eq!(high_memory.grow(3), 0);
+        assert_eq!(low_memory.grow(2), 0);
+
+        let size_table_offset = memory_size_table_address().get() as usize;
+        let mem_bytes = mem.borrow();
+        let low_offset = size_table_offset + memory_size_entry_offset(MemoryId::new(42)) as usize;
+        let high_offset =
+            size_table_offset + memory_size_entry_offset(MemoryId::new(65534)) as usize;
+
+        assert_eq!(read_u64(&mem_bytes, low_offset), 2);
+        assert_eq!(read_u64(&mem_bytes, high_offset), 3);
+
+        drop(mem_bytes);
+
+        let mem_mgr = MemoryManager::init(mem);
+        assert_eq!(mem_mgr.get(MemoryId::new(42)).size(), 2);
+        assert_eq!(mem_mgr.get(MemoryId::new(65534)).size(), 3);
+    }
+
+    #[test]
+    fn updating_memory_size_entry_does_not_rewrite_other_entries() {
+        let mem = make_memory();
+        let mem_mgr = MemoryManager::init(mem.clone());
+        let low_memory = mem_mgr.get(MemoryId::new(42));
+        let high_memory = mem_mgr.get(MemoryId::new(65534));
+
+        assert_eq!(low_memory.grow(2), 0);
+        assert_eq!(high_memory.grow(3), 0);
+        assert_eq!(low_memory.grow(1), 2);
+
+        let size_table_offset = memory_size_table_address().get() as usize;
+        let mem_bytes = mem.borrow();
+        let low_offset = size_table_offset + memory_size_entry_offset(MemoryId::new(42)) as usize;
+        let high_offset =
+            size_table_offset + memory_size_entry_offset(MemoryId::new(65534)) as usize;
+
+        assert_eq!(read_u64(&mem_bytes, low_offset), 3);
+        assert_eq!(read_u64(&mem_bytes, high_offset), 3);
     }
 
     #[test]
@@ -680,11 +871,12 @@ mod test {
         memory.read(0, &mut bytes);
         assert_eq!(bytes, vec![1, 2, 3]);
 
-        assert_eq!(mem_mgr.inner.borrow().memory_buckets[0], vec![BucketId(0)]);
+        assert_eq!(
+            mem_mgr.inner.borrow().memory_buckets.get(&MemoryId(0)),
+            Some(&vec![BucketId(0)])
+        );
 
-        assert!(mem_mgr.inner.borrow().memory_buckets[1..]
-            .iter()
-            .all(|x| x.is_empty()));
+        assert_eq!(mem_mgr.inner.borrow().memory_buckets.len(), 1);
     }
 
     #[test]
@@ -701,13 +893,15 @@ mod test {
         assert_eq!(memory_1.size(), 1);
 
         assert_eq!(
-            &mem_mgr.inner.borrow().memory_buckets[..2],
-            &[vec![BucketId(0)], vec![BucketId(1)],]
+            mem_mgr.inner.borrow().memory_buckets.get(&MemoryId(0)),
+            Some(&vec![BucketId(0)])
+        );
+        assert_eq!(
+            mem_mgr.inner.borrow().memory_buckets.get(&MemoryId(1)),
+            Some(&vec![BucketId(1)])
         );
 
-        assert!(mem_mgr.inner.borrow().memory_buckets[2..]
-            .iter()
-            .all(|x| x.is_empty()));
+        assert_eq!(mem_mgr.inner.borrow().memory_buckets.len(), 2);
 
         memory_0.write(0, &[1, 2, 3]);
         memory_0.write(0, &[1, 2, 3]);
@@ -721,8 +915,11 @@ mod test {
         memory_1.read(0, &mut bytes);
         assert_eq!(bytes, vec![4, 5, 6]);
 
-        // + 1 is for the header.
-        assert_eq!(mem.size(), 2 * BUCKET_SIZE_IN_PAGES + 1);
+        // + BUCKETS_OFFSET_IN_PAGES is for the memory manager metadata.
+        assert_eq!(
+            mem.size(),
+            2 * BUCKET_SIZE_IN_PAGES + BUCKETS_OFFSET_IN_PAGES
+        );
     }
 
     #[test]
@@ -751,6 +948,24 @@ mod test {
     }
 
     #[test]
+    fn can_allocate_and_reinitialize_high_memory_id() {
+        let mem = make_memory();
+        let mem_mgr = MemoryManager::init(mem.clone());
+        let memory = mem_mgr.get(MemoryId::new(65534));
+
+        assert_eq!(memory.grow(1), 0);
+        memory.write(0, &[9, 8, 7]);
+
+        let mem_mgr = MemoryManager::init(mem);
+        let memory = mem_mgr.get(MemoryId::new(65534));
+        assert_eq!(memory.size(), 1);
+
+        let mut bytes = vec![0; 3];
+        memory.read(0, &mut bytes);
+        assert_eq!(bytes, vec![9, 8, 7]);
+    }
+
+    #[test]
     fn growing_same_memory_multiple_times_doesnt_increase_underlying_allocation() {
         let mem = make_memory();
         let mem_mgr = MemoryManager::init(mem.clone());
@@ -759,23 +974,26 @@ mod test {
         // Grow the memory by 1 page. This should increase the underlying allocation
         // by `BUCKET_SIZE_IN_PAGES` pages.
         assert_eq!(memory_0.grow(1), 0);
-        assert_eq!(mem.size(), 1 + BUCKET_SIZE_IN_PAGES);
+        assert_eq!(mem.size(), BUCKETS_OFFSET_IN_PAGES + BUCKET_SIZE_IN_PAGES);
 
         // Grow the memory again. This should NOT increase the underlying allocation.
         assert_eq!(memory_0.grow(1), 1);
         assert_eq!(memory_0.size(), 2);
-        assert_eq!(mem.size(), 1 + BUCKET_SIZE_IN_PAGES);
+        assert_eq!(mem.size(), BUCKETS_OFFSET_IN_PAGES + BUCKET_SIZE_IN_PAGES);
 
         // Grow the memory up to the BUCKET_SIZE_IN_PAGES. This should NOT increase the underlying
         // allocation.
         assert_eq!(memory_0.grow(BUCKET_SIZE_IN_PAGES - 2), 2);
         assert_eq!(memory_0.size(), BUCKET_SIZE_IN_PAGES);
-        assert_eq!(mem.size(), 1 + BUCKET_SIZE_IN_PAGES);
+        assert_eq!(mem.size(), BUCKETS_OFFSET_IN_PAGES + BUCKET_SIZE_IN_PAGES);
 
         // Grow the memory by one more page. This should increase the underlying allocation.
         assert_eq!(memory_0.grow(1), BUCKET_SIZE_IN_PAGES as i64);
         assert_eq!(memory_0.size(), BUCKET_SIZE_IN_PAGES + 1);
-        assert_eq!(mem.size(), 1 + 2 * BUCKET_SIZE_IN_PAGES);
+        assert_eq!(
+            mem.size(),
+            BUCKETS_OFFSET_IN_PAGES + 2 * BUCKET_SIZE_IN_PAGES
+        );
     }
 
     #[test]
@@ -796,7 +1014,10 @@ mod test {
         // Grow the memory by BUCKET_SIZE_IN_PAGES more pages, which will cause the underlying
         // allocation to increase.
         assert_eq!(memory_0.grow(BUCKET_SIZE_IN_PAGES), 1);
-        assert_eq!(mem.size(), 1 + BUCKET_SIZE_IN_PAGES * 2);
+        assert_eq!(
+            mem.size(),
+            BUCKETS_OFFSET_IN_PAGES + BUCKET_SIZE_IN_PAGES * 2
+        );
     }
 
     #[test]
@@ -915,9 +1136,7 @@ mod test {
         let mem = make_memory();
         let mem_mgr = MemoryManager::init_with_bucket_size(mem, 1); // very small bucket size.
 
-        let memories: Vec<_> = (0..MAX_NUM_MEMORIES)
-            .map(|id| mem_mgr.get(MemoryId(id)))
-            .collect();
+        let memories: Vec<_> = (0..255u16).map(|id| mem_mgr.get(MemoryId(id))).collect();
 
         proptest!(|(
             num_memories in 0..255usize,
@@ -950,6 +1169,31 @@ mod test {
                     }
                     assert_eq!(bytes, data);
                 }
+            }
+        });
+    }
+
+    #[test]
+    fn write_and_read_random_bytes_from_sparse_high_memory_ids() {
+        const IDS: [u16; 8] = [0, 1, 42, 255, 256, 1024, 32768, 65534];
+
+        proptest!(|(
+            data in proptest::collection::vec(0..u8::MAX, 0..2*WASM_PAGE_SIZE as usize),
+            offset in 0..10*WASM_PAGE_SIZE
+        )| {
+            let mem = make_memory();
+            let mem_mgr = MemoryManager::init_with_bucket_size(mem.clone(), 1);
+
+            for id in IDS {
+                write(&mem_mgr.get(MemoryId::new(id)), offset, &data);
+            }
+
+            let mem_mgr = MemoryManager::init(mem);
+            for id in IDS {
+                let memory = mem_mgr.get(MemoryId::new(id));
+                let mut bytes = vec![0; data.len()];
+                memory.read(offset, &mut bytes);
+                assert_eq!(bytes, data);
             }
         });
     }
@@ -1007,7 +1251,7 @@ mod test {
             .take((WASM_PAGE_SIZE * 2 + 901) as usize)
             .collect();
 
-        const MEMORIES: u8 = 3;
+        const MEMORIES: u16 = 3;
         let mut memory_id = 0;
         let mut next_memory = || {
             memory_id += 1;
