@@ -171,8 +171,10 @@ const DEFAULT_NODE_CACHE_NUM_SLOTS: usize = 16;
 /// assert_eq!(map_1.get(&1), Some("two".to_string()));
 /// ```
 ///
-/// The [`MemoryManager`](crate::memory_manager::MemoryManager) creates up to 255 virtual memories
-/// from a single contiguous memory, allowing multiple stable structures to safely coexist.
+/// The [`MemoryManager`](crate::memory_manager::MemoryManager) creates up to 65,535 virtual memory
+/// IDs from a single contiguous memory, allowing multiple stable structures to safely coexist. The
+/// number of non-empty virtual memories is bounded by the number of buckets the memory manager can
+/// allocate.
 ///
 /// For complete examples of using multiple stable structures in a production environment, see the
 /// [Quick Start example](https://github.com/dfinity/stable-structures/tree/main/examples/src/quick_start).

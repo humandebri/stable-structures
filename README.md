@@ -89,7 +89,7 @@ assert_eq!(map_1.get(&1), Some(2)); // This assertion fails.
 
 It fails because both `map_1` and `map_2` are using the same stable memory under the hood, and so changes in `map_1` end up changing or corrupting `map_2`.
 
-To address this issue, we make use of the [MemoryManager](memory_manager::MemoryManager), which takes a single memory and creates up to 255 virtual memories for our disposal.
+To address this issue, we make use of the [MemoryManager](memory_manager::MemoryManager), which takes a single memory and creates up to 65,535 virtual memory IDs for our disposal. The number of non-empty virtual memories is bounded by the number of buckets the memory manager can allocate.
 Here's the above failing example, but fixed by using the [MemoryManager](memory_manager::MemoryManager):
 
 ```rust
@@ -105,6 +105,8 @@ map_1.insert(1, 2);
 map_2.insert(1, 3);
 assert_eq!(map_1.get(&1), Some(2)); // Succeeds, as expected.
 ```
+
+If a memory ID is stored as a `u8`, use `MemoryId::from(id)` or `MemoryId::new(id.into())`.
 
 ## Example Canister
 

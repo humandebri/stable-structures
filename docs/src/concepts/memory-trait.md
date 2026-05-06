@@ -80,5 +80,5 @@ assert_eq!(map_1.get(&1), Some(2)); // This assertion fails.
 The code fails because both `map_1` and `map_2` are using the same stable memory.
 This causes changes in one map to affect or corrupt the other.
 
-To solve this problem, the library provides the [MemoryManager](./memory-manager.md), which creates up to 255 virtual memories from a single memory instance.
+To solve this problem, the library provides the [MemoryManager](./memory-manager.md), which creates up to 65,535 virtual memory IDs from a single memory instance. The number of non-empty virtual memories is bounded by the number of buckets the memory manager can allocate.
 We'll explore this solution in the next section.

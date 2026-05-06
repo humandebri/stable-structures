@@ -29,7 +29,7 @@ const K: usize = 1_000;
 const M: usize = 1_000_000;
 
 fn init_memory(id: u8) -> impl Memory {
-    MemoryManager::init(DefaultMemoryImpl::default()).get(MemoryId::new(id))
+    MemoryManager::init(DefaultMemoryImpl::default()).get(MemoryId::new(id.into()))
 }
 
 fn ensure_memory_size(memory: &impl Memory, size: usize) {
